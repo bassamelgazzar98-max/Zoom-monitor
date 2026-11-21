@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""
+Zoom training-session attendance monitor - v1 (advisory only).
+
+Receives Zoom event-subscription webhooks, tracks cumulative absence per
+participant against the 30-minute rule, evaluates waiting-room arrivals
+against an uploaded eligibility sheet (CSV) and a manual exclusion list,
+and shows a live status page with alerts.
+
+Takes NO actions inside Zoom. It watches and advises; the human decides.
+
+Stdlib only. Run: python3 app.py
+
+Config via environment variables:
+  PORT                  default 8080
+  ZOOM_SECRET_TOKEN     Secret Token from the Zoom Marketplace webhook app.
+                        Required in production (used for endpoint validation
+                        and request signature checks). Empty = accept all
+                        POSTs (local testing only; a warning is logged).
+  ABSENCE_LIMIT_MINUTES default 30  (the 30-minute rule)
+  LATE_ALERT_MINUTES    default 10  (joining after this flags a late alert)
+  DB_PATH               default attendance.db
+"""
+
+import csv
+import hashlib
+import hmac
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+import unicodedata
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT = int(os.environ.get("PORT", "8080"))
+SECRET = os.environ.get("ZOOM_SECRET_TOKEN", "")
+ABSENCE_LIMIT_MIN = int(os.environ.get("ABSENCE_LIMIT_MINUTES", "30"))
+LATE_ALERT_MIN = int(os.environ.get("LATE_ALERT_MINUTES", "10"))
+DB_PATH = os.environ.get("DB_PATH", "attendance.db")
+
+LOCK = threading.Lock()
+
+# ---------------------------------------------------------------- database
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with LOCK, db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS meetings(
+          uuid TEXT PRIMARY KEY,
+          meeting_id TEXT,
+          topic TEXT,
+          start_ts REAL,
+          end_ts REAL);
+        CREATE TABLE IF NOT EXISTS participants(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          meeting_uuid TEXT,
+          zoom_user_id TEXT,
+          name TEXT,
+          name_key TEXT,
+          email TEXT,
+          first_join_ts REAL,
+          present_since REAL,
+          present_seconds REAL DEFAULT 0,
+          UNIQUE(meeting_uuid, name_key, zoom_user_id));
+        CREATE TABLE IF NOT EXISTS alerts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts REAL,
+          meeting_uuid TEXT,
+          participant_key TEXT,
+          type TEXT,
+          severity TEXT,
+          message TEXT,
+          UNIQUE(meeting_uuid, participant_key, type));
+        CREATE TABLE IF NOT EXISTS eligibility(
+          name_key TEXT PRIMARY KEY,
+          display_name TEXT,
+          eligible INTEGER);
+        CREATE TABLE IF NOT EXISTS aliases(
+          alias_key TEXT PRIMARY KEY,
+          name_key TEXT);
+        CREATE TABLE IF NOT EXISTS exclusions(
+          name_key TEXT PRIMARY KEY,
+          display_name TEXT,
+          reason TEXT,
+          added_ts REAL);
+        """)
+
+# ------------------------------------------------------- name normalization
+# Arabic display names vary a lot: alef/hamza forms, taa marbuta, yaa/alef
+# maqsura, tatweel, diacritics. We normalize before comparing. Transliterated
+# variants (Mohamed vs محمد) are NOT guessed; they come out as unknown or
+# probable and are flagged for human review. Known variants can be pinned in
+# the eligibility CSV "aliases" column.
+
+AR_MARKS = re.compile(r"[ً-ْٰـ]")
+
+def normalize(name):
+    if not name:
+        return ""
+    n = unicodedata.normalize("NFKD", name.strip().lower())
+    n = AR_MARKS.sub("", n)
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ٱ", "ا"),
+                 ("ة", "ه"), ("ى", "ي"), ("ؤ", "و"), ("ئ", "ي")):
+        n = n.replace(a, b)
+    n = re.sub(r"[^0-9a-zء-غف-ي٠-٩]+", " ", n)
+    return " ".join(n.split())
+
+def token_sim(a, b):
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+PROBABLE_THRESHOLD = 0.6
+
+def match_name(name, conn):
+    """-> (status, matched_display_name)
+    status in: excluded | eligible | ineligible | probable | unknown"""
+    key = normalize(name)
+    if not key:
+        return ("unknown", None)
+    row = conn.execute(
+        "SELECT name_key FROM aliases WHERE alias_key=?", (key,)).fetchone()
+    if row:
+        key = row["name_key"]
+    ex = conn.execute(
+        "SELECT display_name FROM exclusions WHERE name_key=?", (key,)).fetchone()
+    if ex:
+        return ("excluded", ex["display_name"])
+    el = conn.execute(
+        "SELECT display_name, eligible FROM eligibility WHERE name_key=?",
+        (key,)).fetchone()
+    if el:
+        return (("eligible" if el["eligible"] else "ineligible"),
+                el["display_name"])
+    # fuzzy: token overlap against the sheet; ties or weak hits stay unknown
+    best, best_score, tie = None, 0.0, False
+    for r in conn.execute(
+            "SELECT name_key, display_name, eligible FROM eligibility").fetchall():
+        s = token_sim(key, r["name_key"])
+        if s > best_score:
+            best, best_score, tie = r, s, False
+        elif s == best_score and best is not None and r["name_key"] != best["name_key"]:
+            tie = True
+    if best is not None and best_score >= PROBABLE_THRESHOLD and not tie:
+        return ("probable", best["display_name"])
+    return ("unknown", None)
+
+# ------------------------------------------------------------------ helpers
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+def alert(conn, meeting_uuid, pkey, type_, severity, message):
+    """Insert once per (meeting, participant, type). Returns True if new."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO alerts"
+        " (ts, meeting_uuid, participant_key, type, severity, message)"
+        " VALUES (?,?,?,?,?,?)",
+        (time.time(), meeting_uuid, pkey, type_, severity, message))
+    return cur.rowcount > 0
+
+def presence_seconds(p, now):
+    total = p["present_seconds"] or 0.0
+    if p["present_since"]:
+        total += now - p["present_since"]
+    return total
+
+def absence_min(meeting, p, now):
+    start = meeting["start_ts"] or now
+    end = meeting["end_ts"] or now
+    elapsed = max(0.0, end - start)
+    return max(0.0, elapsed - presence_seconds(p, now)) / 60.0
+
+# -------------------------------------------------------------- zoom events
+
+def ensure_meeting(conn, obj, ts):
+    uuid = obj.get("uuid") or str(obj.get("id") or "unknown")
+    conn.execute(
+        "INSERT OR IGNORE INTO meetings (uuid, meeting_id, topic, start_ts)"
+        " VALUES (?,?,?,?)",
+        (uuid, str(obj.get("id") or ""), obj.get("topic") or "",
+         parse_iso(obj.get("start_time")) or ts))
+    row = conn.execute("SELECT * FROM meetings WHERE uuid=?", (uuid,)).fetchone()
+    return row
+
+def find_participant(conn, meeting_uuid, zuid, name_key):
+    if zuid:
+        row = conn.execute(
+            "SELECT * FROM participants WHERE meeting_uuid=? AND zoom_user_id=?",
+            (meeting_uuid, zuid)).fetchone()
+        if row:
+            return row
+    return conn.execute(
+        "SELECT * FROM participants WHERE meeting_uuid=? AND name_key=?",
+        (meeting_uuid, name_key)).fetchone()
+
+def on_waiting_room(conn, meeting, obj, ts):
+    p = obj.get("participant") or {}
+    name = p.get("user_name") or "(no name)"
+    key = normalize(name)
+    topic = meeting["topic"] or meeting["meeting_id"]
+    status, matched = match_name(name, conn)
+    start = meeting["start_ts"] or ts
+    elapsed_min = max(0.0, (ts - start)) / 60.0
+    too_late = elapsed_min >= ABSENCE_LIMIT_MIN
+
+    if status == "excluded":
+        alert(conn, meeting["uuid"], key, "waiting_room_block", "high",
+              f"{name}: طلب دخول من صالة الانتظار وهو في قائمة الاستبعاد "
+              f"- مينفعش يتقبل / On the manual exclusion list - do NOT admit. "
+              f"[{topic}]")
+    elif status == "ineligible":
+        alert(conn, meeting["uuid"], key, "waiting_room_block", "high",
+              f"{name}: طلب دخول وهو في الشيت كمرفوض ({matched}) "
+              f"- مينفعش يتقبل / On the sheet as not allowed - do NOT admit. "
+              f"[{topic}]")
+    elif status == "eligible":
+        if too_late:
+            alert(conn, meeting["uuid"], key, "waiting_room_block", "high",
+                  f"{name}: على قائمة المقبولين لكن وصل بعد مرور "
+                  f"{int(elapsed_min)} دقيقة من السيشن (الحد {ABSENCE_LIMIT_MIN}) "
+                  f"- مينفعش يتقبل / On the accept list but arrived "
+                  f"{int(elapsed_min)} min in (limit {ABSENCE_LIMIT_MIN}) "
+                  f"- do NOT admit. [{topic}]")
+        else:
+            alert(conn, meeting["uuid"], key, "waiting_room_ok", "info",
+                  f"{name}: على قائمة المقبولين - ممكن يتقبل "
+                  f"/ On the accept list - OK to admit. [{topic}]")
+    elif status == "probable":
+        alert(conn, meeting["uuid"], key, "needs_review", "medium",
+              f"{name}: أقرب اسم في الشيت هو ({matched}) - راجع بنفسك قبل "
+              f"القبول / Closest sheet match is ({matched}) - review before "
+              f"admitting. [{topic}]")
+    else:
+        alert(conn, meeting["uuid"], key, "needs_review", "medium",
+              f"{name}: طلب دخول واسمه مش موجود في الشيت - راجع بنفسك "
+              f"/ Not found on the uploaded sheet - review. [{topic}]")
+
+def on_joined(conn, meeting, obj, ts):
+    p = obj.get("participant") or {}
+    name = p.get("user_name") or "(no name)"
+    zuid = p.get("user_id") or ""
+    email = p.get("email") or ""
+    key = normalize(name)
+    join_ts = parse_iso(p.get("join_time")) or ts
+    topic = meeting["topic"] or meeting["meeting_id"]
+
+    # Mid-session deploys: the earliest known start wins.
+    if join_ts < (meeting["start_ts"] or join_ts):
+        conn.execute("UPDATE meetings SET start_ts=? WHERE uuid=?",
+                     (join_ts, meeting["uuid"]))
+        meeting = conn.execute("SELECT * FROM meetings WHERE uuid=?",
+                               (meeting["uuid"],)).fetchone()
+    row = find_participant(conn, meeting["uuid"], zuid, key)
+    if row:
+        # Possible mid-session rename: keep identity via zoom_user_id.
+        if zuid and row["name_key"] != key:
+            alert(conn, meeting["uuid"], key, "renamed", "medium",
+                  f"{row['name']} غيّر اسمه إلى {name} جوه الاجتماع "
+                  f"/ Renamed to {name} mid-meeting. [{topic}]")
+            conn.execute(
+                "UPDATE participants SET name=?, name_key=? WHERE id=?",
+                (name, key, row["id"]))
+        if not row["present_since"]:
+            conn.execute(
+                "UPDATE participants SET present_since=? WHERE id=?",
+                (join_ts, row["id"]))
+        if email and not row["email"]:
+            conn.execute("UPDATE participants SET email=? WHERE id=?",
+                         (email, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO participants (meeting_uuid, zoom_user_id, name,"
+            " name_key, email, first_join_ts, present_since, present_seconds)"
+            " VALUES (?,?,?,?,?,?,?,0)",
+            (meeting["uuid"], zuid, name, key, email, join_ts, join_ts))
+        late_min = (join_ts - (meeting["start_ts"] or join_ts)) / 60.0
+        if late_min > LATE_ALERT_MIN:
+            alert(conn, meeting["uuid"], key, "late", "medium",
+                  f"{name}: دخل السيشن متأخر {int(late_min)} دقيقة "
+                  f"/ Joined {int(late_min)} min late. [{topic}]")
+        status, matched = match_name(name, conn)
+        if status == "probable":
+            alert(conn, meeting["uuid"], key, "needs_review", "medium",
+                  f"{name}: أقرب اسم في الشيت هو ({matched}) - راجع "
+                  f"/ Closest sheet match is ({matched}) - review. [{topic}]")
+        elif status == "unknown":
+            alert(conn, meeting["uuid"], key, "needs_review", "medium",
+                  f"{name}: دخل واسمه مش موجود في الشيت - راجع "
+                  f"/ Joined but not found on the sheet - review. [{topic}]")
+        elif status == "excluded":
+            alert(conn, meeting["uuid"], key, "excluded_inside", "high",
+                  f"{name}: دخل الاجتماع وهو في قائمة الاستبعاد "
+                  f"/ Joined while on the manual exclusion list. [{topic}]")
+        elif status == "ineligible":
+            alert(conn, meeting["uuid"], key, "excluded_inside", "high",
+                  f"{name}: دخل الاجتماع وهو مرفوض في الشيت ({matched}) "
+                  f"/ Joined while marked not allowed on the sheet. [{topic}]")
+
+def on_left(conn, meeting, obj, ts):
+    p = obj.get("participant") or {}
+    name = p.get("user_name") or "(no name)"
+    zuid = p.get("user_id") or ""
+    key = normalize(name)
+    leave_ts = parse_iso(p.get("leave_time")) or ts
+    topic = meeting["topic"] or meeting["meeting_id"]
+
+    row = find_participant(conn, meeting["uuid"], zuid, key)
+    if row and row["present_since"]:
+        gained = max(0.0, leave_ts - row["present_since"])
+        conn.execute(
+            "UPDATE participants SET present_since=NULL,"
+            " present_seconds=present_seconds+? WHERE id=?",
+            (gained, row["id"]))
+        row = conn.execute("SELECT * FROM participants WHERE id=?",
+                           (row["id"],)).fetchone()
+        now = leave_ts
+        if absence_min(meeting, row, now) >= ABSENCE_LIMIT_MIN:
+            alert(conn, meeting["uuid"], key, "absence_exceeded", "high",
+                  f"{name}: خرج وغيابه المتراكم عدّى {ABSENCE_LIMIT_MIN} دقيقة "
+                  f"- لو رجع يطلب دخول، مينفعش يتقبل / Left; cumulative absence "
+                  f"passed {ABSENCE_LIMIT_MIN} min - do NOT re-admit. [{topic}]")
+        else:
+            alert(conn, meeting["uuid"], key, "left", "info",
+                  f"{name}: خرج من الاجتماع (غياب متراكم "
+                  f"{int(absence_min(meeting, row, now))} دقيقة) "
+                  f"/ Left the meeting. [{topic}]")
+
+def handle_event(event, payload, event_ts):
+    ts = (event_ts or int(time.time() * 1000)) / 1000.0
+    obj = (payload or {}).get("object") or {}
+    with LOCK, db() as conn:
+        meeting = ensure_meeting(conn, obj, ts)
+        if event == "meeting.started":
+            conn.execute(
+                "UPDATE meetings SET start_ts=?, topic=? WHERE uuid=?",
+                (parse_iso(obj.get("start_time")) or ts,
+                 obj.get("topic") or meeting["topic"], meeting["uuid"]))
+        elif event == "meeting.ended":
+            conn.execute("UPDATE meetings SET end_ts=? WHERE uuid=?",
+                         (parse_iso(obj.get("end_time")) or ts, meeting["uuid"]))
+            # close presence for anyone still marked inside
+            for r in conn.execute(
+                    "SELECT * FROM participants WHERE meeting_uuid=? AND"
+                    " present_since IS NOT NULL", (meeting["uuid"],)).fetchall():
+                conn.execute(
+                    "UPDATE participants SET present_since=NULL,"
+                    " present_seconds=present_seconds+? WHERE id=?",
+                    (max(0.0, ts - r["present_since"]), r["id"]))
+        elif event == "meeting.participant_joined_waiting_room":
+            on_waiting_room(conn, meeting, obj, ts)
+        elif event == "meeting.participant_joined":
+            on_joined(conn, meeting, obj, ts)
+        elif event == "meeting.participant_left":
+            on_left(conn, meeting, obj, ts)
+
+# ------------------------------------------------------------------- state
+
+def build_state():
+    now = time.time()
+    with LOCK, db() as conn:
+        meetings = []
+        for m in conn.execute(
+                "SELECT * FROM meetings ORDER BY start_ts DESC LIMIT 20").fetchall():
+            plist = []
+            for p in conn.execute(
+                    "SELECT * FROM participants WHERE meeting_uuid=?"
+                    " ORDER BY name", (m["uuid"],)).fetchall():
+                ab = absence_min(m, p, now)
+                if (not p["present_since"] and not m["end_ts"]
+                        and ab >= ABSENCE_LIMIT_MIN):
+                    alert(conn, m["uuid"], p["name_key"],
+                          "absence_exceeded", "high",
+                          f"{p['name']}: الغياب المتراكم عدّى "
+                          f"{ABSENCE_LIMIT_MIN} دقيقة - لو رجع يطلب دخول، "
+                          f"مينفعش يتقبل / Cumulative absence passed "
+                          f"{ABSENCE_LIMIT_MIN} min - do NOT re-admit.")
+                status, matched = match_name(p["name"], conn)
+                late_min = 0
+                if p["first_join_ts"] and m["start_ts"]:
+                    late_min = max(0, (p["first_join_ts"] - m["start_ts"]) / 60.0)
+                plist.append({
+                    "name": p["name"],
+                    "email": p["email"] or "",
+                    "present": bool(p["present_since"]),
+                    "present_min": round(presence_seconds(p, now) / 60.0, 1),
+                    "absence_min": round(ab, 1),
+                    "exceeded": ab >= ABSENCE_LIMIT_MIN,
+                    "late_min": round(late_min, 1),
+                    "match": status,
+                    "matched_sheet_name": matched or "",
+                })
+            meetings.append({
+                "uuid": m["uuid"],
+                "meeting_id": m["meeting_id"],
+                "topic": m["topic"],
+                "start": m["start_ts"],
+                "end": m["end_ts"],
+                "participants": plist,
+            })
+        alerts = [dict(r) for r in conn.execute(
+            "SELECT * FROM alerts ORDER BY ts DESC LIMIT 100").fetchall()]
+        elig_total = conn.execute("SELECT COUNT(*) n FROM eligibility").fetchone()["n"]
+        elig_ok = conn.execute(
+            "SELECT COUNT(*) n FROM eligibility WHERE eligible=1").fetchone()["n"]
+        excl = conn.execute("SELECT COUNT(*) n FROM exclusions").fetchone()["n"]
+    return {
+        "now": now,
+        "config": {"absence_limit_min": ABSENCE_LIMIT_MIN,
+                   "late_alert_min": LATE_ALERT_MIN,
+                   "signature_check": bool(SECRET)},
+        "meetings": meetings,
+        "alerts": alerts,
+        "eligibility": {"total": elig_total, "accepted": elig_ok,
+                        "rejected": elig_total - elig_ok},
+        "exclusions_count": excl,
+    }
+
+# ------------------------------------------------------------------ CSV in
+
+ACCEPT_WORDS = {"accept", "accepted", "yes", "true", "1", "allow", "allowed",
+                "مقبول", "نعم", "حاضر"}
+REJECT_WORDS = {"reject", "rejected", "no", "false", "0", "deny", "denied",
+                "مرفوض", "لا", "غائب"}
+
+def import_eligibility(text, mode):
+    if text.startswith("﻿"):
+        text = text[1:]
+    reader = csv.reader(text.splitlines())
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        return {"error": "empty file"}
+    header = [h.strip().lower() for h in rows[0]]
+    def col(*names, default=None):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return default
+    ci_name = col("name", "full_name", "trainee", "الاسم", "اسم")
+    ci_dec = col("decision", "status", "eligible", "attendance", "القرار", "الحالة")
+    ci_alias = col("aliases", "alias", "zoom_name", "zoom name")
+    if ci_name is None or ci_dec is None:
+        return {"error": "CSV needs columns: name,decision (accept/reject), "
+                         "optional aliases"}
+    imported = ok = no = 0
+    skipped = []
+    with LOCK, db() as conn:
+        if mode != "append":
+            conn.execute("DELETE FROM eligibility")
+            conn.execute("DELETE FROM aliases")
+        for r in rows[1:]:
+            name = (r[ci_name] if ci_name < len(r) else "").strip()
+            dec = (r[ci_dec] if ci_dec < len(r) else "").strip().lower()
+            if not name:
+                continue
+            if dec in ACCEPT_WORDS:
+                eligible = 1
+            elif dec in REJECT_WORDS:
+                eligible = 0
+            else:
+                skipped.append(name)
+                continue
+            key = normalize(name)
+            conn.execute(
+                "INSERT INTO eligibility (name_key, display_name, eligible)"
+                " VALUES (?,?,?) ON CONFLICT(name_key) DO UPDATE SET"
+                " display_name=excluded.display_name,"
+                " eligible=excluded.eligible", (key, name, eligible))
+            if ci_alias is not None and ci_alias < len(r):
+                for alias in (r[ci_alias] or "").split("|"):
+                    ak = normalize(alias)
+                    if ak:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO aliases"
+                            " (alias_key, name_key) VALUES (?,?)", (ak, key))
+            imported += 1
+            ok += eligible
+            no += 1 - eligible
+    return {"imported": imported, "accepted": ok, "rejected": no,
+            "skipped": skipped}
+
+# ------------------------------------------------------------------- page
+
+PAGE = """<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>متابعة الحضور - Attendance Monitor</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:16px}
+h1{font-size:20px}h2{font-size:16px;color:#93c5fd}
+.card{background:#1e293b;border-radius:10px;padding:12px 16px;margin:12px 0}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:6px 8px;border-bottom:1px solid #334155;text-align:right}
+th{color:#94a3b8;font-weight:600}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px}
+.in{background:#065f46}.out{background:#7f1d1d}.ok{background:#065f46}
+.block{background:#991b1b;color:#fff}.review{background:#92400e}.info{background:#1e3a8a}
+.alert{padding:6px 10px;border-radius:8px;margin:4px 0;font-size:14px}
+.small{color:#94a3b8;font-size:12px}
+input,button{font-size:14px;padding:6px 10px;border-radius:6px;border:1px solid #475569;background:#0f172a;color:#e2e8f0}
+button{background:#2563eb;border:none;cursor:pointer}
+</style></head><body>
+<h1>متابعة حضور السيشن - Live Attendance Monitor</h1>
+<div class="card small" id="meta">...</div>
+<div class="card">
+<b>رفع شيت المقبولين/المرفوضين (CSV):</b>
+<input type="file" id="csv" accept=".csv,text/csv">
+<button onclick="uploadCsv()">رفع</button>
+<span class="small" id="csvmsg"></span>
+<div class="small">الأعمدة: name,decision واختياري aliases. القرار: accept أو reject. رفع ملف جديد يستبدل القديم.</div>
+</div>
+<div class="card">
+<b>استبعاد شخص يدويًا:</b>
+<input id="exname" placeholder="الاسم زي ما هيظهر في زوم">
+<input id="exreason" placeholder="السبب (اختياري)">
+<button onclick="addExclusion()">استبعاد</button>
+<span class="small" id="exmsg"></span>
+</div>
+<h2>الاجتماعات</h2><div id="meetings"></div>
+<h2>التنبيهات</h2><div id="alerts"></div>
+<script>
+async function uploadCsv(){
+  const f=document.getElementById('csv').files[0]; if(!f)return;
+  const txt=await f.text();
+  const r=await fetch('/api/eligibility',{method:'POST',body:txt});
+  const j=await r.json();
+  document.getElementById('csvmsg').textContent=j.error?('خطأ: '+j.error):
+    ('اتسجل '+j.imported+' اسم ('+j.accepted+' مقبول / '+j.rejected+' مرفوض)'+(j.skipped&&j.skipped.length?(' - اتخطى: '+j.skipped.join(', ')):''));
+  refresh();
+}
+async function addExclusion(){
+  const name=document.getElementById('exname').value.trim(); if(!name)return;
+  const reason=document.getElementById('exreason').value.trim();
+  const r=await fetch('/api/exclusions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,reason:reason})});
+  const j=await r.json();
+  document.getElementById('exmsg').textContent=j.ok?('اتسجل: '+name):('خطأ');
+  document.getElementById('exname').value='';refresh();
+}
+function fmt(ts){return new Date(ts*1000).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'})}
+async function refresh(){
+  const s=await (await fetch('/api/state')).json();
+  document.getElementById('meta').textContent=
+    'الشيت: '+s.eligibility.total+' اسم ('+s.eligibility.accepted+' مقبول / '+s.eligibility.rejected+' مرفوض) | قائمة الاستبعاد: '+s.exclusions_count+' | حد الغياب: '+s.config.absence_limit_min+' دقيقة'+(s.config.signature_check?'':' | تحذير: توقيع زوم غير مفعّل');
+  let mh='';
+  for(const m of s.meetings){
+    mh+='<div class="card"><b>'+(m.topic||m.meeting_id)+'</b> <span class="small">'+(m.end?'انتهى':'شغال')+' من '+fmt(m.start)+'</span><table><tr><th>الاسم</th><th>الحالة</th><th>حضور (دقيقة)</th><th>غياب متراكم (دقيقة)</th><th>ملاحظات</th></tr>';
+    for(const p of m.participants){
+      let notes=[];
+      if(p.exceeded)notes.push('<span class="badge block">متخطي '+s.config.absence_limit_min+' د - ميتقبلش</span>');
+      if(p.late_min>s.config.late_alert_min)notes.push('متأخر '+Math.round(p.late_min)+' د');
+      if(p.match==='excluded')notes.push('<span class="badge block">مستبعد</span>');
+      if(p.match==='ineligible')notes.push('<span class="badge block">مرفوض في الشيت</span>');
+      if(p.match==='probable')notes.push('<span class="badge review">مطابقة محتملة: '+p.matched_sheet_name+'</span>');
+      if(p.match==='unknown')notes.push('<span class="badge review">مش في الشيت</span>');
+      mh+='<tr><td>'+p.name+'</td><td><span class="badge '+(p.present?'in':'out')+'">'+(p.present?'موجود':'خارج')+'</span></td><td>'+p.present_min+'</td><td>'+p.absence_min+'</td><td>'+notes.join(' ')+'</td></tr>';
+    }
+    mh+='</table></div>';
+  }
+  document.getElementById('meetings').innerHTML=mh||'<div class="card small">لا اجتماعات بعد</div>';
+  let ah='';
+  for(const a of s.alerts){
+    ah+='<div class="alert '+(a.severity==='high'?'block':(a.severity==='medium'?'review':'info'))+'">'+fmt(a.ts)+' - '+a.message+'</div>';
+  }
+  document.getElementById('alerts').innerHTML=ah||'<div class="small">لا تنبيهات بعد</div>';
+}
+refresh(); setInterval(refresh,10000);
+</script></body></html>"""
+
+# ------------------------------------------------------------------- HTTP
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ZoomAttendanceMonitor/1.0"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False))
+
+    def _read_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(n)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/":
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif path == "/health":
+            self._json({"ok": True})
+        elif path == "/api/state":
+            self._json(build_state())
+        elif path == "/api/eligibility":
+            with LOCK, db() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT display_name, eligible FROM eligibility"
+                    " ORDER BY display_name").fetchall()]
+            self._json({"names": rows})
+        elif path == "/api/exclusions":
+            with LOCK, db() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT display_name, reason, added_ts FROM exclusions"
+                    " ORDER BY added_ts DESC").fetchall()]
+            self._json({"exclusions": rows})
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        body = self._read_body()
+
+        if path == "/zoom/webhook":
+            try:
+                data = json.loads(body.decode("utf-8", "replace") or "{}")
+            except Exception:
+                self._json({"error": "bad json"}, 400)
+                return
+            event = data.get("event", "")
+            # Endpoint validation: the CRC challenge-response itself proves
+            # we hold the secret token; Zoom does not sign this request.
+            if event == "endpoint.url_validation":
+                plain = (data.get("payload") or {}).get("plainToken", "")
+                enc = hmac.new(SECRET.encode(), plain.encode(),
+                               hashlib.sha256).hexdigest()
+                self._json({"plainToken": plain, "encryptedToken": enc})
+                return
+            if SECRET:
+                ts_hdr = self.headers.get("x-zm-request-timestamp", "")
+                sig = self.headers.get("x-zm-signature", "")
+                msg = "v0:" + ts_hdr + ":" + body.decode("utf-8", "replace")
+                digest = hmac.new(SECRET.encode(), msg.encode(),
+                                  hashlib.sha256).hexdigest()
+                if not hmac.compare_digest("v0=" + digest, sig):
+                    self._json({"error": "bad signature"}, 401)
+                    return
+            handle_event(event, data.get("payload"), data.get("event_ts"))
+            self._json({"ok": True})
+            return
+
+        if path == "/api/eligibility":
+            mode = parse_qs(urlparse(self.path).query).get("mode", [""])[0]
+            result = import_eligibility(body.decode("utf-8", "replace"), mode)
+            self._json(result, 400 if "error" in result else 200)
+            return
+
+        if path == "/api/eligibility/clear":
+            with LOCK, db() as conn:
+                conn.execute("DELETE FROM eligibility")
+                conn.execute("DELETE FROM aliases")
+            self._json({"ok": True})
+            return
+
+        if path == "/api/exclusions":
+            try:
+                d = json.loads(body.decode("utf-8", "replace") or "{}")
+            except Exception:
+                d = {}
+            name = (d.get("name") or "").strip()
+            if not name:
+                self._json({"error": "name required"}, 400)
+                return
+            with LOCK, db() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO exclusions"
+                    " (name_key, display_name, reason, added_ts)"
+                    " VALUES (?,?,?,?)",
+                    (normalize(name), name, d.get("reason") or "",
+                     time.time()))
+            self._json({"ok": True})
+            return
+
+        if path == "/api/exclusions/remove":
+            try:
+                d = json.loads(body.decode("utf-8", "replace") or "{}")
+            except Exception:
+                d = {}
+            with LOCK, db() as conn:
+                conn.execute("DELETE FROM exclusions WHERE name_key=?",
+                             (normalize(d.get("name") or ""),))
+            self._json({"ok": True})
+            return
+
+        self._json({"error": "not found"}, 404)
+
+def main():
+    init_db()
+    if not SECRET:
+        print("WARNING: ZOOM_SECRET_TOKEN not set - signature checks off "
+              "(local testing only)", flush=True)
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Listening on :{PORT} - status page at /", flush=True)
+    srv.serve_forever()
+
+if __name__ == "__main__":
+    main()
